@@ -1,0 +1,18 @@
+
+Callable 
+Runnable 
+#Both are Functional Interface and having one method each
+
+Callable -> return the value
+<T> call()
+
+Runnable -> no return 
+void run()
+
+Thread t1 =new Thread(Runable r1);
+t1.start(); // it will call run() method of Runnable interface
+
+CompletableFuture.runAsync() is of type VOID whereas 
+CompletableFuture.supplyAsync() is of type supplier i.e return the values
+
+Java21 - Virtual Threads	

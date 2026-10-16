@@ -1,0 +1,118 @@
+
+path :/mnt/c/Users/sandi
+
+1. Docker Image **
+A DOCKER image is a blueprint that contains:
+-Your application code
+-Runtime (Java, Node, Python, etc.)
+-Libraries
+-Dependencies
+-Configuration
+2. Docker Container **
+A CONTAINER is a running instance of that image.
+It is an isolated environment where your application actually runs.
+
+Docker = Build & run one container **
+Kubernetes = Manage thousands of containers automatically **
+Think of Kubernetes as:
+-A traffic controller
+-A doctor (self‑healing)
+-A load balancer
+-A deployment manager
+-A resource optimizer
+-All working together.
+
+kubectl get pods
+kubectl describe pod <name>
+kubectl logs <name> -f
+kubectl exec -it <name> -- sh
+kubectl apply -f app.yaml
+kubectl delete -f app.yaml
+kubectl port-forward svc/myapp 8080:80
+kubectl get all
+kubectl config current-context
+kubectl get nodes
+
+  *****Creatinng Dockerfile and running the container locally*****
+1. add Dockerfile to the project root with the following content:
+create Dockerfile with the following content:
+      FROM eclipse-temurin:21-jre-jammy
+	  WORKDIR /app
+      COPY /target/book-finder-0.0.1-SNAPSHOT.jar app.jar
+      ENTRYPOINT ["java","-jar","app.jar"]
+
+
+2. build the docker image with the following command:
+	  docker build -t myapp:latest .
+	  
+3. to see docket images run the following command:
+       docker images	  
+
+4. run locally with the following command:
+       docker run -p 8096:8096 myapp:latest
+  
+5. run your Docker container with the following command: (same step as step 3)
+       docker run -p 8080:8080 myapp:latest
+  
+6. check if the container is running with the following command:
+      docker ps
+ 
+7.stop the container with the following command:
+      docker stop <container_id>
+ 
+   ***** PUSH the image to docker hub So That Cloud servers can pull it -with the following command: ****
+   *Every cloud needs your image stored in a registry.
+     docker login
+    *PUSH the image to docker hub with the following command:
+	docker tag myapp sandipyadav17891/myapp:v1
+    docker push sandipyadav17891/myapp:v1
+   
+    pull the image from docker hub with the following command:
+    docker pull sandip/myapp:latest
+    
+    *******Deploy the image to cloud server and run it with the following command:***
+    Create an Azure VM
+       ->Azure Portal → Virtual Machines → Create
+         Choose Ubuntu 22.04 LTS
+         Size: Standard_B1s
+         Allow inbound ports: 22 (SSH), 8096 (App)
+         Create username/password
+		 Click Review + Create
+    SSH Into Azure VM
+    	ssh azureuser@<PUBLIC-IP>
+    Install Docker on Azure VM
+		sudo apt update
+		sudo apt install docker.io
+		sudo systemctl start docker
+		sudo systemctl enable docker	
+    Pull Your Image from Docker Hub
+        docker login
+        docker pull sandipyadav17891/myapp:v1
+    Run Your Container on Azure VM
+		docker run -p 8096:8096 sandipyadav17891/myapp:v1   
+    check if the container is running with the following command:
+		docker ps
+		
+	Run the container with the following command:
+		curl http://localhost:8096/books
+		
+	| Stage 		| What You Did 						|
+	| --- 			| --- 		   						|
+	| Docker 		| Built image → ran locally 		|
+	| Docker Hub 	| Tagged → pushed image 			|
+	| Azure VM 		| Created VM → installed Docker		|
+	| Deployment    | Pulled image → ran container 		|
+	| Result 		| App accessible via public IP 		|
+
+
+run the container with the following command:
+curl http://localhost:8096/books
+You can map external 8080 → internal 8096:
+docker run -p 8080:8096 myapp:latest
+
+
+
+
+
+
+

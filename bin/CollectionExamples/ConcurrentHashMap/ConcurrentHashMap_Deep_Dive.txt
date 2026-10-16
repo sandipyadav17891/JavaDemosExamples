@@ -1,0 +1,1100 @@
+# ConcurrentHashMap: A Deep Technical Dive
+
+## Table of Contents
+1. [Architecture Overview](#architecture-overview)
+2. [Internal Structure (Java 8+)](#internal-structure-java-8)
+3. [Synchronization Mechanism](#synchronization-mechanism)
+4. [Key Operations & Thread Safety](#key-operations--thread-safety)
+5. [Comparison with Alternatives](#comparison-with-alternatives)
+6. [Performance Analysis](#performance-analysis)
+7. [Advanced Features](#advanced-features)
+8. [Common Pitfalls](#common-pitfalls)
+9. [Real-World Usage Patterns](#real-world-usage-patterns)
+
+---
+
+## Architecture Overview
+
+### Historical Evolution
+
+**Pre-Java 8 (Segment-Based Locking):**
+- Map divided into 16 fixed segments
+- Each segment is a mini-HashMap with its own ReentrantReadWriteLock
+- Concurrency level = 16 (max 16 threads can write simultaneously)
+- Coarse-grained locking per segment
+
+**Java 8+ (Node-Level Locking with CAS):**
+- Removed segments entirely
+- Uses hash table with individual node synchronization
+- Reads are lock-free using volatile access
+- Writes use CAS for simple cases, synchronized for complex operations
+- Concurrency level now scales with table size (can have hundreds of concurrent writers)
+
+---
+
+## Internal Structure (Java 8+)
+
+### 1. Table Structure
+
+```java
+// Simplified internal representation
+transient volatile Node<K,V>[] table;
+
+// Node class (for hash collisions)
+static class Node<K,V> implements Map.Entry<K,V> {
+    final int hash;
+    final K key;
+    volatile V val;           // volatile for thread-safe visibility
+    volatile Node<K,V> next;  // volatile linked list for collisions
+    
+    Node(int hash, K key, V val, Node<K,V> next) {
+        this.hash = hash;
+        this.key = key;
+        this.val = val;
+        this.next = next;
+    }
+}
+
+// TreeNode (used when bucket has >8 nodes, converts to red-black tree)
+static final class TreeNode<K,V> extends Node<K,V> {
+    TreeNode<K,V> parent;
+    TreeNode<K,V> left;
+    TreeNode<K,V> right;
+    TreeNode<K,V> prev;
+    boolean red;  // red-black tree property
+    // ... tree operations
+}
+```
+
+### 2. Key Fields
+
+```java
+public class ConcurrentHashMap<K,V> extends AbstractMap<K,V>
+    implements ConcurrentMap<K,V>, Serializable {
+    
+    // Capacity: initial size defaults to 16
+    private static final int DEFAULT_CAPACITY = 16;
+    
+    // Load factor: 0.75 by default
+    private static final float LOAD_FACTOR = 0.75f;
+    
+    // Table size threshold: after this many nodes, resize
+    private transient volatile int sizeCtl;
+    
+    // Actual element count (approximate under high concurrency)
+    private transient volatile long baseCount;
+    
+    // Counter cells for distributed counting
+    private transient volatile CounterCell[] counterCells;
+    
+    // When #nodes in a bucket > TREEIFY_THRESHOLD (8), convert to tree
+    static final int TREEIFY_THRESHOLD = 8;
+    
+    // When #nodes in a bucket < UNTREEIFY_THRESHOLD (6), convert back to list
+    static final int UNTREEIFY_THRESHOLD = 6;
+}
+```
+
+### 3. How Buckets Work
+
+Each bucket in the table array is either:
+- **Empty (null)**
+- **Single Node** - hash collision doesn't exist yet
+- **Linked List of Nodes** - multiple keys hash to same bucket
+- **Red-Black Tree (TreeNode)** - 9+ nodes in same bucket (for O(log n) lookup)
+
+```
+Table Array (size = 16):
+┌─────┐
+│ [0] ├──> null
+├─────┤
+│ [1] ├──> Node(hash=17, key="a", val=1)
+├─────┤
+│ [2] ├──> Node(hash=18, key="b", val=2) → Node(hash=34, key="c", val=3)
+├─────┤
+│ [3] ├──> Node(hash=19, key="d", val=4) → Node → ... → TreeNode (8+ nodes)
+├─────┤
+│...  │
+└─────┘
+```
+
+---
+
+## Synchronization Mechanism
+
+### 1. Lock-Free Reads (Volatile Access)
+
+Reads do NOT require any locking. They use **volatile visibility**:
+
+```java
+// From ConcurrentHashMap source
+public V get(Object key) {
+    Node<K,V>[] tab; Node<K,V> e, p; int n, eh; K ek;
+    
+    // Hash the key
+    int h = spread(key.hashCode());
+    
+    // Volatile READ of table (ensures fresh array reference)
+    if ((tab = table) != null && (n = tab.length) > 0 &&
+        (e = tabAt(tab, (n - 1) & h)) != null) {
+        
+        // Check first node in bucket
+        if ((eh = e.hash) == h) {
+            if ((ek = e.key) == key || (ek != null && key.equals(ek)))
+                return e.val;  // Volatile READ (e is volatile, e.val is volatile)
+        }
+        // If hash doesn't match or key doesn't equal, traverse linked list
+        // Each Node.next is volatile, so reads are safe
+        if (eh < 0)
+            return (p = e.find(h, key)) != null ? p.val : null;
+        
+        // Traverse collision chain
+        while ((e = e.next) != null) {
+            if (e.hash == h && ((ek = e.key) == key || (ek != null && key.equals(ek))))
+                return e.val;
+        }
+    }
+    return null;
+}
+
+// Helper method: volatile array access
+static final <K,V> Node<K,V> tabAt(Node<K,V>[] tab, int i) {
+    return (Node<K,V>)U.getObjectVolatile(tab, ((long)i << ASHIFT) + ABASE);
+}
+```
+
+**Why this is safe:**
+- `table` is `volatile` — readers see the latest version
+- Each `Node.val` is `volatile` — readers always see the most recent write
+- Each `Node.next` is `volatile` — traversing the collision chain is thread-safe
+- **No mutual exclusion needed** — multiple threads can read simultaneously
+
+### 2. CAS Operations for Simple Writes
+
+When inserting into an empty bucket, ConcurrentHashMap uses **Compare-And-Swap (CAS)** instead of locking:
+
+```java
+// Simplified putIfAbsent using CAS
+public V putIfAbsent(K key, V value) {
+    return putVal(key, value, true);
+}
+
+private final V putVal(K key, V value, boolean onlyIfAbsent) {
+    // ... validation ...
+    
+    Node<K,V>[] tab; Node<K,V> p; int n, i, h;
+    
+    while ((tab = table) == null || (n = tab.length) == 0)
+        tab = initTable();  // Initialize table if needed
+    
+    // Hash the key
+    if ((p = tabAt(tab, i = (n - 1) & (h = spread(key.hashCode())))) == null) {
+        // Bucket is empty, try CAS insert
+        if (casTabAt(tab, i, null, new Node<K,V>(h, key, value, null))) {
+            ++count;  // Increment size
+            return null;  // Success
+        }
+        // If CAS failed (another thread beat us), loop and retry
+    } else {
+        // Bucket occupied, must synchronize on the node
+        synchronized (p) {
+            // ... insertion logic ...
+        }
+    }
+}
+
+// CAS helper: atomically set table[i] if it's currently null
+static final <K,V> boolean casTabAt(Node<K,V>[] tab, int i,
+                                    Node<K,V> c, Node<K,V> v) {
+    return U.compareAndSwapObject(tab, ((long)i << ASHIFT) + ABASE, c, v);
+}
+```
+
+**Performance advantage:**
+- No lock acquired if bucket was empty
+- Multiple threads can simultaneously insert into *different* empty buckets
+- Only one thread per bucket can proceed at a time
+
+### 3. Synchronized Block for Complex Operations
+
+When a bucket is occupied (collision detected), locking is required:
+
+```java
+private final V putVal(K key, V value, boolean onlyIfAbsent) {
+    // ... (CAS attempt) ...
+    
+    else {
+        V oldVal = null;
+        // Lock acquired HERE on the first node in the bucket
+        synchronized (p) {
+            // Now we have exclusive access to this bucket's chain
+            
+            // Validate nothing changed while waiting for lock
+            if (tabAt(tab, i) == p) {
+                // Handle collision: traverse or add to chain
+                for (Node<K,V> e = p;; e = e.next) {
+                    int eh; K ek;
+                    if ((eh = e.hash) == h && ((ek = e.key) == key || 
+                        (ek != null && key.equals(ek)))) {
+                        oldVal = e.val;
+                        if (!onlyIfAbsent)
+                            e.val = value;  // Update value
+                        break;
+                    }
+                    Node<K,V> pred = e;
+                    if ((e = e.next) == null) {
+                        // Add new node to end of chain
+                        pred.next = new Node<K,V>(h, key, value, null);
+                        ++binCount;
+                        break;
+                    }
+                }
+            }
+        } // Lock released HERE
+        
+        // Check if bucket needs to be converted to tree
+        if (binCount >= TREEIFY_THRESHOLD)
+            treeifyBin(tab, i);
+        
+        return oldVal;
+    }
+}
+```
+
+**Key points:**
+- Lock is acquired on `p` (the first Node in the bucket)
+- Other threads can still access *different* buckets
+- Lock is *fine-grained* to the bucket level, not the whole map
+
+### 4. Resize (Rehashing) with Concurrent Updates
+
+Resizing is the trickiest operation:
+
+```java
+private final void transfer(Node<K,V>[] tab, Node<K,V>[] nextTab) {
+    int n = tab.length, stride;
+    
+    // Calculate stride: each thread handles a range of buckets
+    if ((stride = (NCPU > 1) ? (n >>> 3) / NCPU : n) < MIN_TRANSFER_STRIDE)
+        stride = MIN_TRANSFER_STRIDE;
+    
+    if (nextTab == null) {
+        try {
+            // Allocate larger table
+            nextTab = (Node<K,V>[])new Node[n << 1];
+        } catch (Throwable ex) {
+            sizeCtl = Integer.MAX_VALUE;
+            return;
+        }
+        nextTable = nextTab;
+        transferIndex = n;
+    }
+    
+    int nextn = nextTab.length;
+    
+    // ForwardingNode marks bucket as "being resized"
+    ForwardingNode<K,V> fwd = new ForwardingNode<K,V>(nextTab);
+    
+    boolean advance = true;
+    
+    // Multiple threads can participate in resize
+    for (int i = 0, bound = 0;;) {
+        Node<K,V> f; int fh;
+        
+        while (advance) {
+            // Claim a range of buckets to process
+            if (--i >= bound || finishing)
+                break;
+            else if ((f = tabAt(tab, i)) == null)
+                advance = false;
+            else if ((fh = f.hash) == MOVED)
+                advance = false;
+            else {
+                // Lock the bucket and transfer entries
+                synchronized (f) {
+                    if (tabAt(tab, i) == f) {
+                        Node<K,V> ln, hn;
+                        
+                        // Split chain/tree into two parts for new table
+                        if (fh >= 0) {
+                            // For each entry, compute new bucket position
+                            int runBit = fh & n;
+                            // ... rehash logic ...
+                        } else if (f instanceof TreeNode) {
+                            // Rehash tree
+                        }
+                        
+                        // Link to new table
+                        setTabAt(nextTab, i, ln);
+                        setTabAt(nextTab, i + n, hn);
+                        setTabAt(tab, i, fwd);  // Mark as transferred
+                    }
+                }
+                advance = true;
+            }
+        }
+    }
+}
+
+// ForwardingNode redirects operations to new table during resize
+static final class ForwardingNode<K,V> extends Node<K,V> {
+    final Node<K,V>[] nextTable;
+    
+    ForwardingNode(Node<K,V>[] tab) {
+        super(MOVED, null, null, null);  // MOVED = -1, signals "table being resized"
+        this.nextTable = tab;
+    }
+    
+    @Override
+    Node<K,V> find(int h, Object k) {
+        // Redirect to new table
+        return nextTable.length == 0 ? null :
+               nextTable[(nextTable.length - 1) & h].find(h, k);
+    }
+}
+```
+
+**Multi-threaded resize:**
+- Multiple threads can resize concurrently
+- Each thread claims a range of buckets via CAS on `transferIndex`
+- Buckets mark themselves as "MOVED" during transfer
+- Other threads see ForwardingNode and redirect to new table
+- This prevents blocking readers/writers during resize
+
+---
+
+## Key Operations & Thread Safety
+
+### 1. put(K, V) - Write
+
+```java
+public V put(K key, V value) {
+    return putVal(key, value, false);
+}
+```
+
+**Thread-safety guarantee:**
+- Atomic at the bucket level (not whole map)
+- Two threads writing to *different* buckets proceed in parallel
+- Two threads writing to the *same* bucket serialize (one waits)
+- After put() returns, value is visible to all future get() calls (volatile write)
+
+**Visibility:**
+```java
+// Thread 1
+map.put("key", "value1");
+
+// Thread 2 (will always see "value1")
+String result = map.get("key");
+```
+
+### 2. putIfAbsent(K, V) - Conditional Write
+
+```java
+public V putIfAbsent(K key, V value) {
+    return putVal(key, value, true);  // onlyIfAbsent = true
+}
+```
+
+**Atomic:** Check-and-put is atomic at the bucket level. This is **NOT** a race condition:
+
+```java
+// Thread 1
+if (!map.containsKey("key")) {
+    map.put("key", "value1");
+}
+
+// Thread 2: RACE CONDITION - another thread might insert between check and put
+
+// Thread 1 (SAFE - atomic)
+map.putIfAbsent("key", "value1");
+
+// Thread 2: SAFE - guaranteed only one put succeeds
+```
+
+### 3. compute(K, Function) - Atomic Read-Modify-Write
+
+```java
+public V compute(K key, BiFunction<? super K, ? super V, ? extends V> remappingFunction) {
+    if (key == null) throw new NullPointerException();
+    
+    int h = spread(key.hashCode());
+    V val = null;
+    int delta = 0;
+    int binCount = 0;
+    
+    for (Node<K,V>[] tab = table;;) {
+        Node<K,V> f; int n, i, fh;
+        
+        if ((f = tabAt(tab, i = (n - 1) & h)) == null) {
+            // Bucket empty, create new node
+            Node<K,V> r = new Node<K,V>(h, key, null, null);
+            synchronized (r) {
+                if (casTabAt(tab, i, null, r)) {
+                    val = remappingFunction.apply(key, null);
+                    if (val != null) {
+                        r.val = val;
+                        delta = 1;
+                    } else if (casTabAt(tab, i, r, null)) {
+                        delta = -1;
+                    }
+                    break;
+                }
+            }
+        } else if ((fh = f.hash) == MOVED) {
+            tab = helpTransfer(tab, f);
+        } else {
+            synchronized (f) {
+                if (tabAt(tab, i) == f) {
+                    // Find existing node or prepare to add
+                    for (Node<K,V> e = f;; e = e.next) {
+                        int eh;
+                        if ((eh = e.hash) == h && e.key == key) {
+                            val = remappingFunction.apply(key, e.val);
+                            if (val != null)
+                                e.val = val;
+                            else
+                                delta = -1;  // Mark for removal
+                            break;
+                        }
+                        if ((e = e.next) == null) {
+                            val = remappingFunction.apply(key, null);
+                            if (val != null) {
+                                pred.next = new Node<K,V>(h, key, val, null);
+                                delta = 1;
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+            if (binCount != 0)
+                if (binCount >= TREEIFY_THRESHOLD)
+                    treeifyBin(tab, i);
+                break;
+        }
+    }
+    addCount((long)delta, binCount);
+    return val;
+}
+```
+
+**Atomic Guarantee:**
+- Entire read-modify-write operation happens inside the synchronized block
+- Function sees the current value, applies the transformation, writes back
+- Happens atomically; no other thread can see partial state
+
+```java
+// Example: thread-safe counter
+map.compute("count", (k, v) -> v == null ? 1 : v + 1);
+
+// Even if 1000 threads call this simultaneously, count will be 1000 at the end
+```
+
+### 4. merge(K, V, BiFunction) - Atomic Merge
+
+```java
+public V merge(K key, V value,
+               BiFunction<? super V, ? super V, ? extends V> remappingFunction) {
+    if (key == null || value == null) throw new NullPointerException();
+    
+    int h = spread(key.hashCode());
+    V val = value;
+    int delta = 0;
+    
+    for (Node<K,V>[] tab = table;;) {
+        // ... (similar synchronization as compute) ...
+        
+        // Merge logic: apply function to existing value + new value
+        for (Node<K,V> e = f;; e = e.next) {
+            if ((eh = e.hash) == h && e.key == key) {
+                V ev = e.val;
+                if (ev != null)
+                    val = remappingFunction.apply(ev, value);  // Merge
+                else
+                    val = value;
+                
+                if (val != null)
+                    e.val = val;
+                else
+                    delta = -1;  // Remove if result is null
+                break;
+            }
+        }
+    }
+    addCount((long)delta, binCount);
+    return val;
+}
+```
+
+**Use case:**
+```java
+// Merge counts from multiple sources
+ConcurrentHashMap<String, Long> stats = new ConcurrentHashMap<>();
+
+// Thread 1
+stats.merge("pageviews", 5L, Long::sum);
+
+// Thread 2 (simultaneously)
+stats.merge("pageviews", 3L, Long::sum);
+
+// Result: "pageviews" = 8, atomically computed
+```
+
+### 5. size() - Approximate Count
+
+```java
+public int size() {
+    long n = sumCount();  // Sum of baseCount and CounterCell array
+    return ((n < 0L) ? 0L : (n > (long)Integer.MAX_VALUE) ? Integer.MAX_VALUE : (int)n);
+}
+
+private final long sumCount() {
+    CounterCell[] as = counterCells; CounterCell a;
+    long sum = baseCount;
+    if (as != null) {
+        for (int i = 0; i < as.length; ++i) {
+            if ((a = as[i]) != null)
+                sum += a.value;
+        }
+    }
+    return sum;
+}
+```
+
+**Important:** `size()` is **NOT exact** under high concurrency:
+- Returns approximate count based on baseCount + counterCells
+- Increment operations are distributed across CounterCell array (avoids contention)
+- During resize or high contention, might be off by few elements
+
+```java
+map.put("a", 1);
+System.out.println(map.size());  // Might return 1 or something close
+// Under high concurrency, size() might be approximate
+```
+
+---
+
+## Comparison with Alternatives
+
+### 1. ConcurrentHashMap vs HashMap (unsynchronized)
+
+| Aspect | HashMap | ConcurrentHashMap |
+|--------|---------|-------------------|
+| Thread-safe | NO | YES |
+| Null keys/values | Allowed | NOT allowed |
+| Performance (single-threaded) | Fastest | Slightly slower (volatile ops) |
+| Performance (multi-threaded) | Unsafe | Much faster (concurrent writes) |
+| Locking granularity | N/A | Bucket-level |
+| Iterator | Fast-fail | Weakly consistent |
+
+```java
+// WRONG - race condition
+HashMap<String, Integer> map = new HashMap<>();
+Thread t1 = new Thread(() -> {
+    for (int i = 0; i < 1000; i++) {
+        map.put("key" + i, i);
+    }
+});
+
+// CORRECT - thread-safe
+ConcurrentHashMap<String, Integer> map = new ConcurrentHashMap<>();
+Thread t1 = new Thread(() -> {
+    for (int i = 0; i < 1000; i++) {
+        map.put("key" + i, i);
+    }
+});
+```
+
+### 2. ConcurrentHashMap vs Hashtable
+
+| Aspect | Hashtable | ConcurrentHashMap |
+|--------|-----------|------------------|
+| Thread-safe | YES | YES |
+| Locking | Whole map (synchronized methods) | Bucket-level (fine-grained) |
+| Read performance | Slow (lock required) | Fast (lock-free) |
+| Write concurrency | 1 thread at a time | Multiple threads (different buckets) |
+| Iterator | Fast-fail | Weakly consistent |
+
+```java
+// Hashtable: whole map locked for every operation
+Hashtable<String, Integer> table = new Hashtable<>();
+table.put("a", 1);  // Locks entire map
+
+// ConcurrentHashMap: only bucket locked
+ConcurrentHashMap<String, Integer> map = new ConcurrentHashMap<>();
+map.put("a", 1);    // Locks only bucket for hash("a")
+map.put("b", 2);    // Can proceed in parallel if different bucket
+```
+
+### 3. ConcurrentHashMap vs Collections.synchronizedMap()
+
+```java
+// Collections.synchronizedMap: wraps HashMap with external lock
+Map<String, Integer> syncMap = Collections.synchronizedMap(new HashMap<>());
+
+// Equivalent to:
+synchronized(syncMap) {
+    syncMap.put("a", 1);  // Everything inside lock
+}
+
+// ConcurrentHashMap: fine-grained locking
+ConcurrentHashMap<String, Integer> map = new ConcurrentHashMap<>();
+map.put("a", 1);  // Locks only bucket, not whole map
+```
+
+---
+
+## Performance Analysis
+
+### 1. Lock Contention Scenarios
+
+**Low Contention (Different Buckets):**
+```
+Thread 1: put("key1", val)  → locks bucket 1  → completes in 100ns
+Thread 2: put("key5", val)  → locks bucket 5  → completes in 100ns (parallel!)
+Total time: 100ns (linear scaling)
+```
+
+**High Contention (Same Bucket):**
+```
+Thread 1: put("key1", val)  → locks bucket 1, holds for 1000ns
+Thread 2: put("key1b", val) → waits for bucket 1, then proceeds in 1000ns
+Thread 3: put("key1c", val) → waits for bucket 1, then proceeds in 1000ns
+Total time: 3000ns (sequential)
+```
+
+### 2. Throughput Comparison
+
+```
+Benchmark: 4 threads, 100K operations
+
+HashMap (not thread-safe):
+- Corrupts data, gives wrong results
+- 0 ops/sec (invalid)
+
+Hashtable (whole-map lock):
+- 50,000 ops/sec
+- All threads serialize
+
+Collections.synchronizedMap (external lock):
+- 50,000 ops/sec
+- Same as Hashtable
+
+ConcurrentHashMap (bucket-level lock):
+- 180,000 ops/sec (3.6x faster!)
+- Multiple threads proceed in parallel
+```
+
+### 3. Read Performance
+
+```
+Benchmark: 100 reader threads, no writers
+
+HashMap (not thread-safe):
+- Race conditions, data corruption
+
+Hashtable (synchronized reads):
+- 100,000 ops/sec
+- Each read acquires lock
+
+ConcurrentHashMap (volatile reads):
+- 8,000,000 ops/sec (80x faster!)
+- No lock acquisition needed
+```
+
+---
+
+## Advanced Features
+
+### 1. Distributed Counting (CounterCell Array)
+
+Under high contention, incrementing a single counter causes cache-line contention:
+
+```java
+// Before: all threads contend on baseCount
+private transient volatile long baseCount;
+
+// Solution: distribute increments across multiple cells
+private transient volatile CounterCell[] counterCells;
+
+// During increment, thread picks a random cell
+static final class CounterCell {
+    volatile long value;
+    CounterCell(long x) { value = x; }
+}
+
+// Example: 4 threads incrementing
+// Thread 1: counterCells[0].value++
+// Thread 2: counterCells[1].value++
+// Thread 3: counterCells[2].value++
+// Thread 4: counterCells[3].value++
+// No contention! Each thread increments its own cell
+
+// When size() called: sum = baseCount + counterCells[0] + counterCells[1] + ...
+```
+
+### 2. Treeification (Bucket → Red-Black Tree)
+
+When a bucket accumulates 9+ nodes:
+
+```java
+// Before treeification: O(n) lookup on collision chain
+Bucket[i]: Node1 → Node2 → Node3 → ... → Node9
+
+// After treeification: O(log n) lookup on tree
+        Node5
+       /     \
+    Node2    Node7
+    /  \     /  \
+Node1 Node3 Node6 Node8
+```
+
+**Threshold:** TREEIFY_THRESHOLD = 8 (converts when 9th node added)
+
+```java
+private final void treeifyBin(Node<K,V>[] tab, int index) {
+    Node<K,V> b; int n;
+    
+    if ((b = tabAt(tab, index)) != null) {
+        synchronized (b) {
+            if (tabAt(tab, index) == b) {
+                // Convert chain to TreeNode
+                TreeNode<K,V> hd = null, tl = null;
+                for (Node<K,V> x = b; x != null; x = x.next) {
+                    TreeNode<K,V> p = new TreeNode<K,V>(...);
+                    if (tl == null)
+                        hd = p;
+                    else
+                        tl.linkBefore(p);
+                    tl = p;
+                }
+                setTabAt(tab, index, new TreeBin<K,V>(hd));
+            }
+        }
+    }
+}
+```
+
+### 3. ForwardingNode & Concurrent Resize
+
+During table resize, buckets are marked with ForwardingNode:
+
+```java
+// Before resize
+Table v1:
+[0] → null
+[1] → Node("a", 1) → Node("b", 2)
+[2] → null
+[3] → Node("c", 3)
+
+// During resize (Thread 1 processes buckets 0-2, Thread 2 processes buckets 3-5)
+Table v1:
+[0] → ForwardingNode (points to v2)
+[1] → ForwardingNode (points to v2)
+[2] → ForwardingNode (points to v2)
+[3] → Node("c", 3)  (not yet transferred)
+
+Table v2 (new, larger):
+[0] → null
+[1] → Node("a", 1)
+[2] → Node("b", 2)
+[3] → null
+[4] → null
+[5] → null
+[6] → Node("c", 3)  (rehashed here)
+
+// Thread 3 reading during resize:
+get("a"):
+  - Reads table v1[1] → sees ForwardingNode
+  - ForwardingNode.find() redirects to v2
+  - Finds "a" in v2[1]
+```
+
+---
+
+## Common Pitfalls
+
+### 1. Null Values Cause NullPointerException
+
+```java
+ConcurrentHashMap<String, String> map = new ConcurrentHashMap<>();
+
+map.put("key", null);  // NullPointerException!
+
+// Workaround: wrap in Optional or use explicit sentinel
+map.put("key", "EMPTY");
+```
+
+**Why?** Null is used internally to signify "key absent". Allowing null would be ambiguous:
+```java
+// If null allowed, this is ambiguous:
+String val = map.get("key");
+if (val == null) {
+    // Was "key" absent, or was it mapped to null?
+}
+```
+
+### 2. Iterator is Weakly Consistent, Not Atomic Snapshot
+
+```java
+ConcurrentHashMap<String, Integer> map = new ConcurrentHashMap<>();
+for (int i = 0; i < 100; i++)
+    map.put("key" + i, i);
+
+Thread t1 = new Thread(() -> {
+    for (String key : map.keySet()) {
+        // Will see updates made by t2 while iterating
+        // Won't throw ConcurrentModificationException
+        System.out.println(key);
+    }
+});
+
+Thread t2 = new Thread(() -> {
+    for (int i = 100; i < 200; i++)
+        map.put("key" + i, i);  // Concurrent modification
+});
+
+t1.start(); t2.start();
+// Iterator continues despite t2's modifications
+```
+
+### 3. size() is Approximate Under High Concurrency
+
+```java
+ConcurrentHashMap<String, Integer> map = new ConcurrentHashMap<>();
+
+// Thread 1-4 each put 25 elements
+new Thread(() -> {
+    for (int i = 0; i < 25; i++)
+        map.put("t1_" + i, i);
+}).start();
+
+// ... more threads ...
+
+// All threads started
+Thread.sleep(100);
+
+int size = map.size();
+// Might return 95, 96, 97, 99, or 100
+// Approximate because increments are distributed
+```
+
+### 4. Compound Operations Still Need External Sync
+
+```java
+ConcurrentHashMap<String, Integer> map = new ConcurrentHashMap<>();
+
+// WRONG - race condition
+if (!map.containsKey("key")) {
+    map.put("key", 1);
+    // Another thread can insert between containsKey and put
+}
+
+// CORRECT - use atomic compound operation
+map.putIfAbsent("key", 1);
+
+// Also WRONG - race condition
+if (map.get("counter") == null) {
+    map.put("counter", 0);
+}
+int newVal = map.get("counter") + 1;
+map.put("counter", newVal);
+
+// CORRECT - use atomic read-modify-write
+map.compute("counter", (k, v) -> (v == null ? 0 : v) + 1);
+```
+
+### 5. Iteration During Resize Can be Slow
+
+```java
+ConcurrentHashMap<String, Integer> map = new ConcurrentHashMap<>(1);
+
+// Add 1000 elements, causing resizes
+for (int i = 0; i < 1000; i++)
+    map.put("key" + i, i);
+
+// Iteration might have to traverse both old and new tables
+for (String key : map.keySet()) {
+    // Slower during/after resize
+}
+```
+
+---
+
+## Real-World Usage Patterns
+
+### 1. Thread-Safe Cache
+
+```java
+public class UserCache {
+    private final ConcurrentHashMap<String, User> cache = 
+        new ConcurrentHashMap<>();
+    
+    public User getUser(String userId) {
+        // Atomic: get existing or compute if absent
+        return cache.computeIfAbsent(userId, id -> {
+            // Fetch from database only once per key
+            return database.loadUser(id);
+        });
+    }
+    
+    public void updateUser(User user) {
+        cache.put(user.getId(), user);
+    }
+}
+```
+
+### 2. Statistics/Metrics Collection
+
+```java
+public class MetricsCollector {
+    private final ConcurrentHashMap<String, Long> metrics = 
+        new ConcurrentHashMap<>();
+    
+    public void recordEvent(String eventName) {
+        // Atomic increment
+        metrics.merge(eventName, 1L, Long::sum);
+    }
+    
+    public Map<String, Long> getMetrics() {
+        // Returns snapshot (values might be slightly stale)
+        return new HashMap<>(metrics);
+    }
+}
+
+// Usage: multiple threads recording events
+Thread t1 = new Thread(() -> {
+    for (int i = 0; i < 1000; i++)
+        collector.recordEvent("login");
+});
+
+Thread t2 = new Thread(() -> {
+    for (int i = 0; i < 500; i++)
+        collector.recordEvent("logout");
+});
+
+t1.start(); t2.start();
+t1.join(); t2.join();
+
+System.out.println(collector.getMetrics());
+// {login=1000, logout=500}
+```
+
+### 3. Connection Pool
+
+```java
+public class ConnectionPool {
+    private final ConcurrentHashMap<String, Queue<Connection>> poolByDatabase =
+        new ConcurrentHashMap<>();
+    
+    public Connection getConnection(String dbName) {
+        // Get or create queue for this database
+        Queue<Connection> queue = poolByDatabase.computeIfAbsent(dbName, 
+            k -> new ConcurrentLinkedQueue<>());
+        
+        // Get connection from queue, or create new
+        Connection conn = queue.poll();
+        if (conn == null || !conn.isValid()) {
+            conn = createConnection(dbName);
+        }
+        return conn;
+    }
+    
+    public void releaseConnection(String dbName, Connection conn) {
+        poolByDatabase.get(dbName).offer(conn);
+    }
+}
+```
+
+### 4. Distributed Locking (Warning: Use Only for Non-Critical Sections)
+
+```java
+public class SimpleLockManager {
+    private final ConcurrentHashMap<String, Object> locks = 
+        new ConcurrentHashMap<>();
+    
+    public void acquireLock(String lockName) {
+        Object lockObj = locks.computeIfAbsent(lockName, k -> new Object());
+        synchronized (lockObj) {
+            // Critical section
+        }
+    }
+}
+
+// NOTE: For production, use proper distributed locking (Redis, Zookeeper, etc.)
+```
+
+### 5. High-Throughput Event Processing
+
+```java
+public class EventBroker {
+    private final ConcurrentHashMap<String, ConcurrentLinkedQueue<Event>> 
+        queues = new ConcurrentHashMap<>();
+    
+    public void publishEvent(String topic, Event event) {
+        // Get or create queue for this topic
+        queues.computeIfAbsent(topic, k -> new ConcurrentLinkedQueue<>())
+              .offer(event);
+    }
+    
+    public void subscribe(String topic, EventHandler handler) {
+        ConcurrentLinkedQueue<Event> queue = queues.get(topic);
+        if (queue != null) {
+            Event event;
+            while ((event = queue.poll()) != null) {
+                handler.handle(event);
+            }
+        }
+    }
+}
+
+// Multiple publishers and subscribers work in parallel
+new Thread(() -> {
+    for (int i = 0; i < 1000; i++)
+        broker.publishEvent("orders", new OrderEvent(...));
+}).start();
+
+new Thread(() -> {
+    broker.subscribe("orders", order -> processOrder(order));
+}).start();
+```
+
+---
+
+## Summary Table
+
+| Operation | Time Complexity | Thread-Safe | Notes |
+|-----------|-----------------|-------------|-------|
+| get(K) | O(1) avg, O(log n) worst | YES (lock-free) | Volatile reads, no locking |
+| put(K, V) | O(1) avg, O(log n) worst | YES (bucket lock) | Bucket-level synchronization |
+| putIfAbsent(K, V) | O(1) avg, O(log n) worst | YES (atomic) | CAS + sync |
+| compute(K, F) | O(1) avg, O(log n) worst | YES (atomic) | Read-modify-write atomic |
+| merge(K, V, F) | O(1) avg, O(log n) worst | YES (atomic) | Merge operation atomic |
+| remove(K) | O(1) avg, O(log n) worst | YES (bucket lock) | Bucket-level synchronization |
+| size() | O(n) | NO (approximate) | Distributed counting |
+| containsKey(K) | O(1) avg, O(log n) worst | YES (lock-free) | Volatile reads |
+| keySet()/entrySet() | O(n) | YES (weakly) | Iterator doesn't freeze the map |
+
+---
+
+## When NOT to Use ConcurrentHashMap
+
+1. **Single-threaded code** — use HashMap (faster, no volatile overhead)
+2. **If you need null values** — use HashMap or wrap values in Optional
+3. **If you need atomic snapshots** — use Collections.synchronizedMap + external locking, or copy the map
+4. **If you need exact size()** — track size separately, or call size() once and cache result
+
+---
+
+## Conclusion
+
+ConcurrentHashMap is a masterclass in concurrent data structure design:
+- **Lock-free reads** via volatiles for maximum throughput
+- **Fine-grained bucket-level locking** for writers to avoid bottlenecks
+- **CAS operations** when possible to avoid locks entirely
+- **Atomic compound operations** (compute, merge) for race-free logic
+- **Distributed counting** to reduce contention on size tracking
+- **Concurrent resizing** so rehashing doesn't block readers/writers
+
+Use it whenever you have multiple threads accessing a shared key-value store. It's battle-tested in production and provides one of the best balance of safety, speed, and simplicity.

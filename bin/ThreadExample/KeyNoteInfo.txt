@@ -1,0 +1,10 @@
+
+Callable 
+Runnable 
+#Both are Functional Interface and having one method each
+
+Callable -> return the value
+<T> call()
+
+Runnable -> no return 
+void run()

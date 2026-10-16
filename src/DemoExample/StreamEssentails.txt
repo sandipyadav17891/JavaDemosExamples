@@ -1,0 +1,22 @@
+		
+		**convert the Lists of List into single List
+		stream.filter().flatMap(List::stream)
+		
+		** how to stream string 
+		String hello="Hello World";
+		hello.chars().mapToObj(x ->(char)x)
+		
+		**common elements
+		List<Integer> lista=List.of(1,4,67,55);
+		List<Integer> listb=List.of(5,4,68,55);
+		System.out.println(lista.stream().filter(listb::contains));
+		
+		**when just asked by Group by 
+				System.out.println(emp.stream()
+		.collect(Collectors.groupingBy(x ->x.getSalary())));
+		
+		** when ask just to get JUST NAME*** using strem
+		emp.stream()
+		.collect(
+		Collectors.groupingBy(x ->x.getSalary(),
+		Collectors.mapping(x ->x.getName(), Collectors.toList())));
